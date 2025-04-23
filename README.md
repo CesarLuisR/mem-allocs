@@ -32,4 +32,6 @@ Uses `mmap` to request large blocks of memory and allocates from them internally
 ---
 
 ## 🧪 Build
-`gcc -o "filename" "filename"`
+`gcc "filename" -o "filename"`
+Example: gcc mmap_alloc.c -o a
+Then: ./a
