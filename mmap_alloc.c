@@ -13,6 +13,9 @@ typedef struct block_t {
     void* addr;
     struct block_t* next;
     struct block_t* prev;
+    struct block_t* next_free;
+    struct block_t* prev_free;
+    struct page_t* page;
 } block_t;
 
 typedef struct page_t {
@@ -36,29 +39,26 @@ static inline uintptr_t align_up(uintptr_t addr, size_t alignment) {
 }
 
 static page_t* initial_page = NULL;
+static block_t* free_head = NULL;
 
-loc_t find_loc(page_t* init, size_t size) {
-    page_t* curr = init;
+loc_t find_loc(size_t size) {
+    if (free_head == NULL) {
+        loc_t loc;
+        loc.found = 0;
+        return loc;
+    }
 
-    while (curr) {
-        if (curr->free_size < size) {
-            curr = curr->next;
-            continue;
+    block_t* curr = free_head;
+
+    while(curr) {
+        if (curr->used == 0 && curr->size >= size) {
+            loc_t loc;
+            loc.page = curr->page;
+            loc.block = curr;
+            loc.found = 1;
+            return loc;
         }
-
-        block_t* curr_block = curr->first_free;
-        while (curr_block) {
-            if (curr_block->used == 0 && curr_block->size >= size) {
-                loc_t loc;
-                loc.page = curr;
-                loc.block = curr_block;
-                loc.found = 1;
-                return loc;
-            }
-            curr_block = curr_block->next;
-        }
-
-        curr = curr->next;
+        curr = curr->next_free;
     }
 
     loc_t loc;
@@ -69,8 +69,7 @@ loc_t find_loc(page_t* init, size_t size) {
 void* mmap_alloc(size_t size) {
     size_t page_size = sysconf(_SC_PAGESIZE);
 
-    // adding the page_t size (40) and block_t (40) size that is required for allocations
-    size_t size_to_pages = ((size + 80 + page_size - 1) / page_size) * page_size;
+    size_t size_to_pages = ((size + sizeof(page_t) + sizeof(block_t) + page_size - 1) / page_size) * page_size;
 
     size = align_up(size, ALIGNMENT);
 
@@ -97,6 +96,7 @@ void* mmap_alloc(size_t size) {
         block->prev = NULL;
         header->free_size -= sizeof(block_t) + size;
         header->first_free = block;
+        block->page = header;
 
         next_addr = (void*)((uintptr_t)next_addr + sizeof(block_t) + size);
         block_t* big_free_block = (block_t*)next_addr;
@@ -104,7 +104,12 @@ void* mmap_alloc(size_t size) {
         big_free_block->used = 0;
         big_free_block->addr = next_addr + sizeof(block_t);
         big_free_block->prev = block;
-        big_free_block->next = NULL;
+        big_free_block->page = header;
+
+        free_head = big_free_block;
+        free_head->next_free = NULL;
+        free_head->prev_free = NULL;
+        
         block->next = big_free_block;
 
         // Why this doesnt work???
@@ -113,7 +118,7 @@ void* mmap_alloc(size_t size) {
         return block->addr;
     }
 
-    loc_t loc = find_loc(initial_page, size);
+    loc_t loc = find_loc(size);
     if (loc.found == 1) {
         page_t* find_page = loc.page;
         block_t* find_block = loc.block;
@@ -132,12 +137,26 @@ void* mmap_alloc(size_t size) {
         big_free_block->addr = next_addr + sizeof(block_t);
         big_free_block->prev = find_block;
         big_free_block->next = NULL;
+        big_free_block->page = find_page;
         find_block->next = big_free_block;
+
+        big_free_block->next_free = find_block->next_free;
+        big_free_block->prev_free = find_block->prev_free;
+
+        if (find_block->prev_free) {
+            find_block->prev_free->next_free = big_free_block;
+        } else {
+            free_head = big_free_block;
+        }
+
+        if (find_block->next_free) {
+            find_block->next_free->prev_free = big_free_block;
+        }
 
         return find_block->addr;
     }
 
-    // There is not found loc
+    // If there is not found loc
     void* addr = mmap(NULL, size_to_pages, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
     if (addr == MAP_FAILED) {
         perror("Error al asignar la memoria");
@@ -161,6 +180,7 @@ void* mmap_alloc(size_t size) {
     block->used = 1;
     block->addr = next_addr + sizeof(block_t);
     block->prev = NULL;
+    block->page = header;
     header->free_size -= sizeof(block_t) + size;
     header->first_free = block;
 
@@ -171,7 +191,13 @@ void* mmap_alloc(size_t size) {
     big_free_block->addr = next_addr + sizeof(block_t);
     big_free_block->prev = block;
     big_free_block->next = NULL;
+    big_free_block->page = header;
     block->next = big_free_block;
+
+    big_free_block->prev_free = NULL;
+    big_free_block->next_free = free_head;
+    free_head->prev_free = big_free_block;
+    free_head = big_free_block;
 
     header->free_size -= sizeof(block_t);
 
@@ -180,6 +206,8 @@ void* mmap_alloc(size_t size) {
 
 void mmap_free(void* ptr) {
     page_t* curr = initial_page;
+    block_t* curr_block = NULL;
+
     while (curr) {
         block_t* curr_b = curr->first_free;
 
@@ -189,6 +217,16 @@ void mmap_free(void* ptr) {
                 curr->free_size += curr_b->size;
 
                 if (curr_b->prev && curr_b->prev->used == 0) {
+                    if (curr_b->prev_free) {
+                        curr_b->prev_free->next_free = curr_b->next_free;
+                    } else {
+                        free_head = curr_b->next_free;
+                    }
+
+                    if (curr_b->next_free) {
+                        curr_b->next_free->prev_free = curr_b->prev_free;
+                    }
+
                     curr_b->prev->size += curr_b->size;
                     curr_b->prev->next = curr_b->next;
                     if (curr_b->next != NULL) {
@@ -200,6 +238,16 @@ void mmap_free(void* ptr) {
                 }
 
                 if (curr_b->next && curr_b->next->used == 0) {
+                    if (curr_b->next->prev_free) {
+                        curr_b->next->prev_free->next_free = curr_b->next->next_free;
+                    } else {
+                        free_head = curr_b->next->next_free;
+                    }
+
+                    if (curr_b->next->next_free) {
+                        curr_b->next->next_free->prev_free = curr_b->next->prev_free;
+                    }
+
                     curr_b->size += curr_b->next->size;
                     curr_b->next = curr_b->next->next;
                     if (curr_b->next != NULL) {
@@ -209,22 +257,43 @@ void mmap_free(void* ptr) {
                     curr->free_size += sizeof(block_t);
                 }
 
+                curr_b->prev_free = NULL;
+                curr_b->next_free = free_head;
+
+                if (free_head) {
+                    free_head->prev_free = curr_b;
+                }
+
+                curr_block = curr_b;
+                free_head = curr_b;
+
                 break;
             }
 
             curr_b = curr_b->next;
         }
 
-        // adding the page_t and block_t (40 + 40);
-        if (curr->free_size + 80 == curr->size) {
+        if (curr->free_size + sizeof(page_t) + sizeof(block_t) == curr->size) {
+            if (curr == initial_page) {
+                initial_page = curr->next;
+            }
+
             if (curr->prev)
                 curr->prev->next = curr->next;
 
             if (curr->next)
                 curr->next->prev = curr->prev;
 
-            if (curr == initial_page)
-                initial_page = curr->next;
+            // Free list remove block
+            if (curr_block->prev_free) {
+                curr_block->prev_free->next_free = curr_block->next_free;
+            } else {
+                free_head = curr_block->next_free;
+            }
+
+            if (curr_block->next_free) {
+                curr_block->next_free->prev_free = curr_block->prev_free;
+            }
 
             if (munmap(curr, curr->size) == -1) return;
 
@@ -248,6 +317,7 @@ void mem_map(page_t* init) {
         while (curr_b) {
             printf("Block #%d, addr: %d\n", block_counter++, (uintptr_t)curr_b);
             printf("Block size: %d, used: %d\n", curr_b->size, curr_b->used);
+
             curr_b = curr_b->next;
         }
         curr = curr->next;
@@ -262,27 +332,52 @@ int main(int argc, char *argv[]) {
     int* y = mmap_alloc(sizeof(int));
     *y = 10;
 
-    char* s = mmap_alloc(sizeof(char) * 2000);
-    mmap_free(y);
-
-    char* z = mmap_alloc(sizeof(int) * 10);
     mmap_free(x);
 
-    char* m = mmap_alloc(sizeof(char) * 4096);
+    char* hola = mmap_alloc(sizeof(char) * 4000);
+    mmap_free(hola);
+    char* buenas = mmap_alloc(sizeof(char) * 3900);
+    char* adios = mmap_alloc(sizeof(char) * 500);
 
-    mmap_free(s);
-    mmap_free(m);
-    mmap_free(z);
+    int* p1 = mmap_alloc(1024);
+    for (int i = 0; i < 256; i++) p1[i] = i;
+    mmap_free(p1);
 
+    int* p2 = mmap_alloc(512);
+    for (int i = 0; i < 128; i++) p2[i] = i + 1;
+    int* p3 = mmap_alloc(256);
+    for (int i = 0; i < 64; i++) p3[i] = (i + 1) * 2;
+
+    void* z = mmap_alloc(0);
+    mmap_free(NULL);
+    if (z) {
+        mmap_free(z);
+    }
+
+    // Estrés con múltiples asignaciones y liberaciones
+    void* arr[10];
+    for (int i = 0; i < 10; i++) {
+        arr[i] = mmap_alloc(100 * (i + 1));
+    }
+    for (int i = 0; i < 10; i += 2) {
+        mmap_free(arr[i]);
+    }
+    for (int i = 1; i < 10; i += 2) {
+        mmap_free(arr[i]);
+    }
     mem_map(initial_page);
-    
-    // char* y = mmap_alloc(sizeof(int) * 400);
-    // char* x = mmap_alloc(sizeof(char) * 2300);
-    //
-    // mmap_free(y);
-    // mmap_free(x);
-    //
-    // mem_map(initial_page);
+
+    if (initial_page == NULL) return 0;
+    printf("FREE LIST: \n");
+    block_t* free_curr = free_head;
+    int block_counter = 1;
+
+    // Aqui hay un problema con el free
+    while (free_curr != NULL) {
+        printf("Block #%d, addr: %d\n", block_counter++, (uintptr_t)free_curr);
+        printf("Block size: %d, used: %d\n", free_curr->size, free_curr->used);
+        free_curr = free_curr->next_free;
+    }
 
     return 0;
 }
