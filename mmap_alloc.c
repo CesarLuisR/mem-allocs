@@ -372,7 +372,6 @@ int main(int argc, char *argv[]) {
     block_t* free_curr = free_head;
     int block_counter = 1;
 
-    // Aqui hay un problema con el free
     while (free_curr != NULL) {
         printf("Block #%d, addr: %d\n", block_counter++, (uintptr_t)free_curr);
         printf("Block size: %d, used: %d\n", free_curr->size, free_curr->used);
